@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 
 from __future__ import annotations
-from typing import ClassVar, Dict, List, Mapping, NewType, Optional, Tuple, TypedDict, cast, overload
+from typing import (Callable, ClassVar, Dict, List, Mapping, NewType, Optional, Tuple,
+        TypedDict, TypeVar, Type, cast, overload)
 
+import abc
 import base58
 import base64
-import secrets
 import json
+import secrets
 
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.asymmetric import ed25519
@@ -97,23 +99,20 @@ class KeyPair:
     def __repr__(self) -> str:
         return 'KeyPair(private: {}, public: {})'.format(self.private, self.public)
 
-class B64Str(str):
-    def __new__(cls, data: str) -> B64Str:
-        base64.b64decode(B64Str._pad(data).encode('utf-8'), validate = True)
+ABT = TypeVar('ABT', bound='AbstractB64Str')
+class AbstractB64Str(str):
+    def __new__(cls: Type[ABT], data: str) -> ABT:
+        pdata = AbstractB64Str._pad(data)
+        base64.b64decode(pdata.encode('utf-8'), validate = True)
+
         return super().__new__(cls, data) # type: ignore
 
     @classmethod
-    def from_bytes(cls, data: bytes) -> B64Str:
+    def from_bytes(cls: Type[ABT], data: bytes) -> ABT:
         return cls(base64.b64encode(data).decode('utf-8'))
 
     def to_bytes(self) -> bytes:
-        return base64.b64decode(B64Str._pad(self).encode('utf-8'))
-
-    def unpad(self) -> B64Str:
-        return B64Str(self.rstrip('='))
-
-    def pad(self) -> B64Str:
-        return B64Str(self)
+        return base64.b64decode(AbstractB64Str._pad(self).encode('utf-8'))
 
     @staticmethod
     def _pad(data: str) -> str:
@@ -121,6 +120,26 @@ class B64Str(str):
         if p_needed < 4:
             return data + '=' * p_needed
         return data
+
+    @staticmethod
+    def _unpad(data: str) -> str:
+        return data.rstrip('=')
+
+class B64Str(AbstractB64Str):
+    def __new__(cls, data: str) -> B64Str:
+        pdata = AbstractB64Str._pad(data)
+        return super().__new__(cls, pdata) # type: ignore
+
+    def unpad(self) -> B64StrU:
+        return B64StrU(self)
+
+class B64StrU(AbstractB64Str):
+    def __new__(cls, data: str) -> B64StrU:
+        udata = AbstractB64Str._unpad(data)
+        return super().__new__(cls, udata) # type: ignore
+
+    def pad(self) -> B64Str:
+        return B64Str(self)
 
 class B58Str(str):
     def __new__(cls, data: str) -> B58Str:
@@ -315,16 +334,34 @@ class XSigningKeyRing:
                 self.self_signing_key, self.user_signing_key, self.device_keys)
 
     def __str__(self) -> str:
-        return """XSigningKeyRing(
-    master: {},
-    user_id: {},
-    self_signing: {},
-    user_signing: {},
-    device_keys: {}
-)""".format(
-        self.master_key, self.user_id,
-        self.self_signing_key, self.user_signing_key,
-        self.device_keys)
+        ss_b64 = None
+        if self.self_signing_key:
+            ss_b64 = self.self_signing_key.public.to_B64Str().unpad()
+
+        us_b64 = None
+        if self.user_signing_key:
+            us_b64 = self.user_signing_key.public.to_B64Str().unpad()
+
+        devkeys = ''
+        for dev_id, pub in self.device_keys.items():
+            pub_b64 = pub.to_B64Str().unpad()
+            devkeys = devkeys + (
+                    "\n        {}: {}".format(dev_id, pub_b64)
+            )
+
+        return (
+                "User {}:\n"
+                "    Master Key: {}\n"
+                "    Self-signing Key: {}\n"
+                "        Signed Devices: {}\n"
+                "    User-signing Key: {}"
+        ).format(
+                self.user_id,
+                self.master_key.to_B64Str().unpad(),
+                ss_b64,
+                '{}',
+                us_b64
+        ).format(devkeys or "None")
 
     @classmethod
     def from_master_key_dict(cls, priv: Optional[PrivateKey], keydat: XSigningKeyDict) -> XSigningKeyRing:
@@ -383,6 +420,9 @@ class XSigningKeyRing:
         if not keydat['keys']:
             raise ValueError("No keys!")
 
+        if len(keydat['keys']) > 1:
+            raise ValueError("No keys!")
+
         # assume just one key
         pub = PublicKey.from_B64Str(B64Str(next(iter(keydat['keys'].values()))))
         return KeyPair(priv, pub)
@@ -436,6 +476,9 @@ class XSigningKeyRing:
 
         self._check_signature(self.user_signing_key.public, keydat)
 
+    # TODO: function to verify device key via own device key... probably have
+    # to rework verify_user_key_by_device too... perhaps make separate device
+    # signing keyring, probably safer to do it explicitly though...
     def verify_user_key_by_device(self, keydat: XSigningKeyDict) -> None:
         if "master" not in keydat['usage']:
             raise ValueError("Invalid key usage type!")
@@ -521,7 +564,8 @@ class KeyQueryDict(TypedDict):
 
 def build_keyring(keys: KeyQueryDict, user_id: str,
         master_key: Optional[PrivateKey] = None,
-        self_signing_key: Optional[PrivateKey] = None) -> XSigningKeyRing:
+        self_signing_key: Optional[PrivateKey] = None,
+        user_signing_key: Optional[PrivateKey] = None) -> XSigningKeyRing:
     if user_id not in keys['master_keys']:
         raise ValueError("No master key!")
     if user_id not in keys['self_signing_keys']:
@@ -533,6 +577,9 @@ def build_keyring(keys: KeyQueryDict, user_id: str,
         raise ValueError("Invalid user ID!")
 
     kr.set_self_signing_key(self_signing_key, keys['self_signing_keys'][user_id])
+
+    if user_id in keys['user_signing_keys']:
+        kr.set_user_signing_key(user_signing_key, keys['user_signing_keys'][user_id])
 
     if user_id not in keys['device_keys']:
         warnings.warn("No devices for user {}!".format(user_id))
@@ -550,13 +597,11 @@ def build_keyring(keys: KeyQueryDict, user_id: str,
 def build_own_keyring(keys: KeyQueryDict, user_id: str,
         master_key: PrivateKey, self_signing_key: PrivateKey,
         user_signing_key: PrivateKey) -> XSigningKeyRing:
-    kr = build_keyring(keys, user_id, master_key, self_signing_key)
+    kr = build_keyring(keys, user_id, master_key, self_signing_key, user_signing_key)
 
     # add user-signing key
-    if user_id not in keys['user_signing_keys']:
+    if not kr.user_signing_key:
         raise ValueError("No user-signing key!")
-
-    kr.set_user_signing_key(user_signing_key, keys['user_signing_keys'][user_id])
 
     return kr
 
@@ -580,71 +625,209 @@ def fetch_own_keyring(client: MatrixClient, user_id: str, rkey: B58Str,
 
     return build_own_keyring(keys, user_id, ms, ss, us)
 
-def fetch_keyring_unverified(client: MatrixClient, user_id: str) -> XSigningKeyRing:
-    # query keys
-    # TODO: proper checks instead of cast
-    keys = cast(KeyQueryDict, client.get_user_keys(user_id))
-
-    return build_keyring(keys, user_id)
-
-def fetch_keyring_verified(client: MatrixClient, user_id: str, root: XSigningKeyRing) -> XSigningKeyRing:
+def fetch_keyring(client: MatrixClient, user_id: str,
+        verifier: Callable[[XSigningKeyDict], None]) -> XSigningKeyRing:
     # query keys
     # TODO: proper checks instead of cast
     keys = cast(KeyQueryDict, client.get_user_keys(user_id))
 
     # verify master key against given keyring
-    root.verify_user_key(keys['master_keys'][user_id])
+    verifier(keys['master_keys'][user_id])
 
     return build_keyring(keys, user_id)
 
-def fetch_keyring_device_verified(client: MatrixClient, user_id: str, root: XSigningKeyRing) -> XSigningKeyRing:
-    # query keys
-    # TODO: proper checks instead of cast
-    keys = cast(KeyQueryDict, client.get_user_keys(user_id))
+class PublicKeyVerifier:
+    pub: PublicKey
 
-    # verify master key against given keyring
-    root.verify_user_key_by_device(keys['master_keys'][user_id])
+    def __init__(self, pub: PublicKey):
+        self.pub = pub
 
-    return build_keyring(keys, user_id)
+    def __call__(self, keydat: XSigningKeyDict) -> None:
+        if not keydat['keys']:
+            raise ValueError("No keys!")
 
-def fetch_keyring_pubkey_verified(client: MatrixClient, user_id: str, pub: PublicKey) -> XSigningKeyRing:
-    kr = fetch_keyring_unverified(client, user_id)
+        if len(keydat['keys']) > 1:
+            raise ValueError("No keys!")
 
-    # compare master key with given public key
-    if kr.master_key.to_B64Str() != pub.to_B64Str():
-        raise ValueError("Invalid public key!")
+        # compare key with given public key
+        key_b64 = B64Str(next(iter(keydat['keys'].values())))
+        if key_b64 != self.pub.to_B64Str():
+            raise ValueError("Invalid public key!")
 
-    return kr
+def InsecureVerifier(keydat: XSigningKeyDict) -> None:
+    pass
 
 def post_keyring_signature(client: MatrixClient, signer: XSigningKeyRing, signee: XSigningKeyRing) -> None:
     keydat = signee.get_master_key_dict()
     signed = signer.sign_user_key(keydat)
     signer.verify_user_key(signed)
-    mc.post_user_signature(signee.user_id, signee.master_key.to_B64Str().unpad(), signed)
+    client.post_user_signature(signee.user_id, signee.master_key.to_B64Str().unpad(), signed)
 
 # TODO: check if foreign master key is signed by foreign device key which is signed with own device key which is signed by self-signing key (to bootstrap cross-trust from device-trust)
+# TODO: validate inputs from server (jsonschema?)
 
+# TODO: potential use cases:
+#       listing a user's public keys (optional trust anchor)
+#       signing an individual user's master key (trust anchor?)
+#       exporting own signatures for later use as trust anchor?
+#       signing a list of user's master keys
+#       potential turst anchors:
+#           - own master key (give pubkey or recovery key to make sure
+#           - other list with signatures from other user, anchor with pubkey or by transitivity from own key
+#           - other user's master key (give pubkey or insure signed by own key... transitivity?)
+#           - just a list of mxid, pubkey tuples
+#       difference between own key and other ppl's key user-signing key is accessible
+
+import argparse
+import os
 import sys
 
+def cmd_list_pubkeys(client: MatrixClient, args: argparse.Namespace) -> None:
+    print(fetch_keyring(client, args.target, args.trust_anchor))
+
+class AbstractSelfCached:
+    namespace: argparse.Namespace
+    client: MatrixClient
+    self: Optional[XSigningKeyRing]
+
+    def __init__(self, namespace: argparse.Namespace):
+        self.namespace = namespace
+        self.self = None
+
+    def set_client(self, client: MatrixClient):
+        self.client = client
+
+    @abc.abstractmethod
+    def _get_self(self) -> XSigningKeyRing:
+        pass
+
+    def __call__(self) -> XSigningKeyRing:
+        if not self.self:
+            self.self = self._get_self()
+
+        return self.self
+
+class SelfPubkey(AbstractSelfCached):
+    def _get_self(self) -> XSigningKeyRing:
+        ver = PublicKeyVerifier(self.namespace.pubkey)
+        return fetch_keyring(self.client, self.namespace.login, ver)
+
+class SelfRecovery(AbstractSelfCached):
+    def _get_self(self) -> XSigningKeyRing:
+        return fetch_own_keyring(self.client, self.namespace.login, self.namespace.recovery_key())
+
+class SelfAction(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None) -> None:
+        if values == 'pubkey':
+            if not namespace.pubkey:
+                parser.error('--pubkey/-p required for --self=pubkey')
+
+            namespace.self = SelfPubkey(namespace)
+
+        else:
+            namespace.self = SelfRecovery(namespace)
+
+class TrustAnchorAction(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None) -> None:
+        if values == 'self':
+            if not namespace.self:
+                parser.error('--self/-s required for --trust-anchor=self')
+
+            def self_verifier(keydat: XSigningKeyDict) -> None:
+                namespace.self().verify_user_key(keydat)
+            namespace.trust_anchor = self_verifier
+
+        elif values == 'pubkey':
+            if not namespace.pubkey:
+                parser.error('--pubkey/-p required for --trust-anchor=pubkey')
+
+            def pubkey_verifier(keydat: XSigningKeyDict) -> None:
+                PublicKeyVerifier(namespace.pubkey)(keydat)
+            namespace.trust_anchor = pubkey_verifier
+
+        else:
+            namespace.trust_anchor = InsecureVerifier
+
+def access_token(arg: str) -> Callable[[], str]:
+    def access_token_value() -> str:
+        return arg
+    def access_token_input() -> str:
+        return input("Access Token: ")
+
+    if not arg:
+        return access_token_input
+
+    return access_token_value
+
+def public_key(arg: str) -> PublicKey:
+    return PublicKey.from_B64Str(B64Str(arg))
+
+def recovery_key(arg: str) -> Callable[[], B58Str]:
+    def recovery_key_value() -> B58Str:
+        return B58Str(arg.replace(' ', ''))
+    def recovery_key_input() -> B58Str:
+        return B58Str(input("Recovery Key: ").replace(' ', ''))
+
+    if not arg:
+        return recovery_key_input
+
+    return recovery_key_value
+
 if __name__ == "__main__":
-    baseurl = sys.stdin.readline().rstrip()
-    authtok = sys.stdin.readline().rstrip()
-    reckey = sys.stdin.readline().rstrip()
-    ownuid = sys.stdin.readline().rstrip()
-    otheruid = sys.stdin.readline().rstrip()
-    otherpub = sys.stdin.readline().rstrip()
+    parser = argparse.ArgumentParser(description = "Do some cross-signing things.")
 
-    mc = MatrixClient(baseurl, authtok)
-    key_b58 = B58Str(reckey.replace(" ", ""))
+    parser.add_argument('--url', '-u', required=True,
+            help="Homeserver URL.")
+    parser.add_argument('--login', '-l', required=True,
+            help="Your own user's MXID.")
+    parser.add_argument('--access-token', '-a',
+            default=os.environ.get('MATRIX_ACCESS_TOKEN', ''),
+            type=access_token,
+            help=(
+                "The user's access token. Read from the MATRIX_ACCESS_TOKEN environment "
+                "variable or stdin if not specified."))
 
-    ttid = ownuid
-    ttkr = fetch_own_keyring(mc, ttid, key_b58)
-    print(ttkr)
+    parser.add_argument('--pubkey', '-p', type=public_key)
 
-    nmkr = fetch_keyring_pubkey_verified(mc, otheruid,
-            PublicKey.from_B64Str(B64Str(otherpub)))
-    print(nmkr)
+    parser.add_argument('--recovery-key', '-r',
+            default=os.environ.get('MATRIX_RECOVERY_KEY', ''),
+            type=recovery_key,
+            help=(
+                "The user's recovery key. Read from the MATRIX_RECOVERY_KEY environment "
+                "variable or stdin if not specified and --self=recovery."))
+    parser.add_argument('--self', '-s', choices=['pubkey', 'recovery'],
+            action=SelfAction,
+            help=("How to get your own keys. "
+                  "Options are 'recovery', which will fetch the private keys from the "
+                  "secret storage, and 'pubkey' (see --pubkey), which will download your "
+                  "public keys and check the master key against the specified public key."))
 
-    post_keyring_signature(mc, ttkr, nmkr)
+    ta_act = parser.add_argument('--trust-anchor', '-t', default='self',
+            choices=['self', 'pubkey', 'none'],
+            action=TrustAnchorAction,
+            help=(
+                "All keys need to be signed directly or indirectly by the trust anchor. "
+                "Options are 'self' for your own master key (see --self), "
+                "'pubkey' for a Base 64 encoded public key (see --pubkey) "
+                "and 'none' for no verification."))
 
-    print("signed lol")
+    subparsers = parser.add_subparsers(dest='command', title='commands', required=True,
+            help="Available commands.")
+
+    list_p = subparsers.add_parser('list',
+            help="List the target user's public keys.")
+    list_p.add_argument('target', metavar='MXID',
+            help="MXID of the target user.")
+    list_p.set_defaults(func=cmd_list_pubkeys)
+
+    parsed_args = parser.parse_args()
+
+    if parsed_args.trust_anchor == ta_act.default:
+        ta_act(parser, parsed_args, ta_act.default)
+
+    client = MatrixClient(parsed_args.url, parsed_args.access_token())
+
+    if parsed_args.self:
+        parsed_args.self.set_client(client)
+
+    parsed_args.func(client, parsed_args)
