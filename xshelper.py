@@ -637,10 +637,10 @@ def fetch_keyring(client: MatrixClient, user_id: str,
     return build_keyring(keys, user_id)
 
 class PublicKeyVerifier:
-    pub: PublicKey
+    pubs: Dict[str, PublicKey]
 
-    def __init__(self, pub: PublicKey):
-        self.pub = pub
+    def __init__(self, pubs: Dict[str, PublicKey]):
+        self.pubs = pubs
 
     def __call__(self, keydat: XSigningKeyDict) -> None:
         if not keydat['keys']:
@@ -651,7 +651,13 @@ class PublicKeyVerifier:
 
         # compare key with given public key
         key_b64 = B64Str(next(iter(keydat['keys'].values())))
-        if key_b64 != self.pub.to_B64Str():
+
+        user_id = keydat['user_id']
+
+        if not self.pubs[user_id]:
+            raise ValueError("No public key for user {}!".format(user_id))
+
+        if key_b64 != self.pubs[user_id].to_B64Str():
             raise ValueError("Invalid public key!")
 
 def InsecureVerifier(keydat: XSigningKeyDict) -> None:
@@ -683,70 +689,82 @@ import os
 import sys
 
 def cmd_list_pubkeys(client: MatrixClient, args: argparse.Namespace) -> None:
-    print(fetch_keyring(client, args.target, args.trust_anchor))
+    for t in args.targets:
+        print(fetch_keyring(client, t, args.trust_anchor(args)))
 
-class AbstractSelfCached:
+def cmd_own_pubkeys(client: MatrixClient, args: argparse.Namespace) -> None:
+    print(args.own(args))
+
+class AbstractOwnCached:
     namespace: argparse.Namespace
     client: MatrixClient
-    self: Optional[XSigningKeyRing]
+    own: Optional[XSigningKeyRing]
 
     def __init__(self, namespace: argparse.Namespace):
         self.namespace = namespace
-        self.self = None
+        self.own = None
 
     def set_client(self, client: MatrixClient):
         self.client = client
 
     @abc.abstractmethod
-    def _get_self(self) -> XSigningKeyRing:
+    def _get_own(self, namespace: argparse.Namespace) -> XSigningKeyRing:
         pass
 
-    def __call__(self) -> XSigningKeyRing:
-        if not self.self:
-            self.self = self._get_self()
+    def __call__(self, namespace: argparse.Namespace) -> XSigningKeyRing:
+        if not self.own:
+            self.own = self._get_own(namespace)
 
-        return self.self
+        return self.own
 
-class SelfPubkey(AbstractSelfCached):
-    def _get_self(self) -> XSigningKeyRing:
-        ver = PublicKeyVerifier(self.namespace.pubkey)
-        return fetch_keyring(self.client, self.namespace.login, ver)
+class OwnPubkey(AbstractOwnCached):
+    pub: PublicKey
 
-class SelfRecovery(AbstractSelfCached):
-    def _get_self(self) -> XSigningKeyRing:
-        return fetch_own_keyring(self.client, self.namespace.login, self.namespace.recovery_key())
+    def __init__(self, namespace: argparse.Namespace, pub: PublicKey):
+        super(OwnPubkey, self).__init__(namespace)
+        self.pub = pub
 
-class SelfAction(argparse.Action):
+    def _get_own(self, namespace: argparse.Namespace) -> XSigningKeyRing:
+        ver = PublicKeyVerifier({namespace.login: self.pub})
+        return fetch_keyring(self.client, namespace.login, ver)
+
+class OwnRecovery(AbstractOwnCached):
+    def _get_own(self, namespace: argparse.Namespace) -> XSigningKeyRing:
+        return fetch_own_keyring(self.client, namespace.login, namespace.recovery_key())
+
+class OwnAction(argparse.Action):
     def __call__(self, parser, namespace, values, option_string=None) -> None:
-        if values == 'pubkey':
-            if not namespace.pubkey:
-                parser.error('--pubkey/-p required for --self=pubkey')
-
-            namespace.self = SelfPubkey(namespace)
+        if values == 'recovery':
+            namespace.own = OwnRecovery(namespace)
 
         else:
-            namespace.self = SelfRecovery(namespace)
+            pub_b64 =  PublicKey.from_B64Str(B64Str(values))
+            namespace.own = OwnPubkey(namespace, pub_b64)
 
 class TrustAnchorAction(argparse.Action):
     def __call__(self, parser, namespace, values, option_string=None) -> None:
-        if values == 'self':
-            if not namespace.self:
-                parser.error('--self/-s required for --trust-anchor=self')
+        if values == 'own':
+            if not namespace.own:
+                parser.error('--own/-o required for --trust-anchor=own')
 
-            def self_verifier(keydat: XSigningKeyDict) -> None:
-                namespace.self().verify_user_key(keydat)
-            namespace.trust_anchor = self_verifier
+            def get_own_verifier(namespace: argparse.Namespace) -> Callable[[XSigningKeyDict], None]:
+                return namespace.own(namespace).verify_user_key
+            namespace.trust_anchor = get_own_verifier
 
         elif values == 'pubkey':
             if not namespace.pubkey:
                 parser.error('--pubkey/-p required for --trust-anchor=pubkey')
 
-            def pubkey_verifier(keydat: XSigningKeyDict) -> None:
-                PublicKeyVerifier(namespace.pubkey)(keydat)
-            namespace.trust_anchor = pubkey_verifier
+            def get_pubkey_verifier(namespace: argparse.Namespace) -> Callable[[XSigningKeyDict], None]:
+                if len(namespace.pubkey) < len(namespace.targets):
+                    raise ValueError("Not enough public keys!")
+
+                ks = dict(zip(namespace.targets, namespace.pubkey))
+                return PublicKeyVerifier(ks)
+            namespace.trust_anchor = get_pubkey_verifier
 
         else:
-            namespace.trust_anchor = InsecureVerifier
+            namespace.trust_anchor = lambda _: InsecureVerifier
 
 def access_token(arg: str) -> Callable[[], str]:
     def access_token_value() -> str:
@@ -787,47 +805,72 @@ if __name__ == "__main__":
                 "The user's access token. Read from the MATRIX_ACCESS_TOKEN environment "
                 "variable or stdin if not specified."))
 
-    parser.add_argument('--pubkey', '-p', type=public_key)
+    pub_args = ['--pubkey', '-p']
+    pub_kwargs = {
+            'type': public_key,
+            'action': 'extend',
+            'nargs': '+'
+    }
 
-    parser.add_argument('--recovery-key', '-r',
-            default=os.environ.get('MATRIX_RECOVERY_KEY', ''),
-            type=recovery_key,
-            help=(
+    rec_args = ['--recovery-key', '-r']
+    rec_kwargs = {
+            'default': os.environ.get('MATRIX_RECOVERY_KEY', ''),
+            'type': recovery_key,
+            'help': (
                 "The user's recovery key. Read from the MATRIX_RECOVERY_KEY environment "
-                "variable or stdin if not specified and --self=recovery."))
-    parser.add_argument('--self', '-s', choices=['pubkey', 'recovery'],
-            action=SelfAction,
-            help=("How to get your own keys. "
-                  "Options are 'recovery', which will fetch the private keys from the "
-                  "secret storage, and 'pubkey' (see --pubkey), which will download your "
-                  "public keys and check the master key against the specified public key."))
+                "variable or stdin if not specified and --own=recovery.")
+    }
 
-    ta_act = parser.add_argument('--trust-anchor', '-t', default='self',
-            choices=['self', 'pubkey', 'none'],
-            action=TrustAnchorAction,
-            help=(
+    own_args = ['--own', '-o']
+    own_kwargs = {
+            'action': OwnAction,
+            'help': (
+                "How to get your own keys. "
+                "Options are 'recovery', which will fetch the private keys from the "
+                "secret storage, or specifying a Base 64 encoded public key, which will "
+                "download your public keys and check the master key against the specified "
+                "public key.")
+    }
+
+    ta_args = ['--trust-anchor', '-t']
+    ta_kwargs = {
+            'default': 'own',
+            'choices': ['own', 'pubkey', 'none'],
+            'action': TrustAnchorAction,
+            'help': (
                 "All keys need to be signed directly or indirectly by the trust anchor. "
-                "Options are 'self' for your own master key (see --self), "
+                "Options are 'own' for your own master key (see --own), "
                 "'pubkey' for a Base 64 encoded public key (see --pubkey) "
-                "and 'none' for no verification."))
+                "and 'none' for no verification.")
+    }
 
     subparsers = parser.add_subparsers(dest='command', title='commands', required=True,
             help="Available commands.")
 
     list_p = subparsers.add_parser('list',
-            help="List the target user's public keys.")
-    list_p.add_argument('target', metavar='MXID',
-            help="MXID of the target user.")
+            help="List the target users' public keys.")
+    list_p.add_argument(*pub_args, **pub_kwargs) # type: ignore
+    list_p.add_argument(*rec_args, **rec_kwargs) # type: ignore
+    list_p.add_argument(*own_args, **own_kwargs) # type: ignore
+    ta_act = list_p.add_argument(*ta_args, **ta_kwargs) # type: ignore
+    list_p.add_argument('targets', metavar='MXID', action='extend', nargs='+',
+            help="MXID of a target user.")
     list_p.set_defaults(func=cmd_list_pubkeys)
+
+    own_p = subparsers.add_parser('own',
+            help="List your own public keys.")
+    own_p.set_defaults(func=cmd_own_pubkeys)
+    own_p.add_argument(*rec_args, **rec_kwargs) # type: ignore
+    own_p.add_argument(*own_args, **own_kwargs, required=True) # type: ignore
 
     parsed_args = parser.parse_args()
 
-    if parsed_args.trust_anchor == ta_act.default:
+    if 'trust_anchor' in parsed_args and parsed_args.trust_anchor == ta_act.default:
         ta_act(parser, parsed_args, ta_act.default)
 
     client = MatrixClient(parsed_args.url, parsed_args.access_token())
 
-    if parsed_args.self:
-        parsed_args.self.set_client(client)
+    if parsed_args.own:
+        parsed_args.own.set_client(client)
 
     parsed_args.func(client, parsed_args)
