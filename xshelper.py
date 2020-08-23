@@ -523,6 +523,11 @@ class MatrixClient:
         r.raise_for_status()
         return r.json()
 
+    def post_user_signatures(self, sigs: Dict[str, Dict[str, XSigningKeyDict]]) -> None:
+        r = requests.post(self.base_url + MatrixClient.MATRIX_SIG_UPLOAD_EP,
+                json = sigs, headers = self.headers)
+        r.raise_for_status()
+
     def post_user_signature(self, user_id: str, key_id: str, keydat: XSigningKeyDict) -> None:
         r = requests.post(self.base_url + MatrixClient.MATRIX_SIG_UPLOAD_EP,
                 json = {user_id:{key_id:keydat}}, headers = self.headers)
@@ -658,16 +663,10 @@ class PublicKeyVerifier:
             raise ValueError("No public key for user {}!".format(user_id))
 
         if key_b64 != self.pubs[user_id].to_B64Str():
-            raise ValueError("Invalid public key!")
+            raise ValueError("Public key for user {} does not match expected value!".format(user_id))
 
 def InsecureVerifier(keydat: XSigningKeyDict) -> None:
     pass
-
-def post_keyring_signature(client: MatrixClient, signer: XSigningKeyRing, signee: XSigningKeyRing) -> None:
-    keydat = signee.get_master_key_dict()
-    signed = signer.sign_user_key(keydat)
-    signer.verify_user_key(signed)
-    client.post_user_signature(signee.user_id, signee.master_key.to_B64Str().unpad(), signed)
 
 # TODO: check if foreign master key is signed by foreign device key which is signed with own device key which is signed by self-signing key (to bootstrap cross-trust from device-trust)
 # TODO: validate inputs from server (jsonschema?)
@@ -688,7 +687,26 @@ import argparse
 import os
 import sys
 
+def cmd_sign_pubkeys(client: MatrixClient, args: argparse.Namespace) -> None:
+    signer = args.own(args)
+    sigs: Dict[str, Dict[str, XSigningKeyDict]] = dict()
+
+    for t in args.targets:
+        signee = fetch_keyring(client, t, args.trust_anchor(args))
+
+        key_id = signee.master_key.to_B64Str().unpad()
+        keydat = signee.get_master_key_dict()
+        signed = signer.sign_user_key(keydat)
+
+        if t not in sigs:
+            sigs[t] = dict()
+        sigs[t][key_id] = signed
+
+    if sigs:
+        client.post_user_signatures(sigs)
+
 def cmd_list_pubkeys(client: MatrixClient, args: argparse.Namespace) -> None:
+    # TODO: warn, don't die
     for t in args.targets:
         print(fetch_keyring(client, t, args.trust_anchor(args)))
 
@@ -834,7 +852,7 @@ if __name__ == "__main__":
 
     ta_args = ['--trust-anchor', '-t']
     ta_kwargs = {
-            'default': 'own',
+            'required': True,
             'choices': ['own', 'pubkey', 'none'],
             'action': TrustAnchorAction,
             'help': (
@@ -852,7 +870,7 @@ if __name__ == "__main__":
     list_p.add_argument(*pub_args, **pub_kwargs) # type: ignore
     list_p.add_argument(*rec_args, **rec_kwargs) # type: ignore
     list_p.add_argument(*own_args, **own_kwargs) # type: ignore
-    ta_act = list_p.add_argument(*ta_args, **ta_kwargs) # type: ignore
+    list_p.add_argument(*ta_args, **ta_kwargs) # type: ignore
     list_p.add_argument('targets', metavar='MXID', action='extend', nargs='+',
             help="MXID of a target user.")
     list_p.set_defaults(func=cmd_list_pubkeys)
@@ -863,10 +881,17 @@ if __name__ == "__main__":
     own_p.add_argument(*rec_args, **rec_kwargs) # type: ignore
     own_p.add_argument(*own_args, **own_kwargs, required=True) # type: ignore
 
-    parsed_args = parser.parse_args()
+    sign_p = subparsers.add_parser('sign',
+            help="Sign other users' master keys.")
+    sign_p.add_argument(*pub_args, **pub_kwargs) # type: ignore
+    sign_p.add_argument(*rec_args, **rec_kwargs) # type: ignore
+    sign_p.add_argument(*own_args, **own_kwargs, choices=['recovery'], required=True) # type: ignore
+    sign_p.add_argument(*ta_args, **{**ta_kwargs, 'choices': ['pubkey', 'none']}) # type: ignore
+    sign_p.add_argument('targets', metavar='MXID', action='extend', nargs='+',
+            help="MXID of a target user.")
+    sign_p.set_defaults(func=cmd_sign_pubkeys)
 
-    if 'trust_anchor' in parsed_args and parsed_args.trust_anchor == ta_act.default:
-        ta_act(parser, parsed_args, ta_act.default)
+    parsed_args = parser.parse_args()
 
     client = MatrixClient(parsed_args.url, parsed_args.access_token())
 
