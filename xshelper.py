@@ -517,9 +517,10 @@ class MatrixClient:
         r.raise_for_status()
         return r.json()
 
-    def get_user_keys(self, user_id: str) -> dict:
+    def get_user_keys(self, user_ids: List[str]) -> dict:
+        ukl: Dict[str, List[str]] = dict(zip(user_ids, [[]] * len(user_ids)))
         r = requests.post(self.base_url + MatrixClient.MATRIX_KEY_QUERY_EP,
-                json = {"device_keys":{user_id:[]}}, headers = self.headers)
+                json = {"device_keys":ukl}, headers = self.headers)
         r.raise_for_status()
         return r.json()
 
@@ -626,20 +627,36 @@ def fetch_own_keyring(client: MatrixClient, user_id: str, rkey: B58Str,
 
     # query keys
     # TODO: proper checks instead of cast
-    keys = cast(KeyQueryDict, client.get_user_keys(user_id))
+    keys = cast(KeyQueryDict, client.get_user_keys([user_id]))
 
     return build_own_keyring(keys, user_id, ms, ss, us)
 
-def fetch_keyring(client: MatrixClient, user_id: str,
-        verifier: Callable[[XSigningKeyDict], None]) -> XSigningKeyRing:
+def fetch_keyrings(client: MatrixClient, user_ids: List[str],
+        verifier: Callable[[XSigningKeyDict], None]) -> List[XSigningKeyRing]:
     # query keys
     # TODO: proper checks instead of cast
-    keys = cast(KeyQueryDict, client.get_user_keys(user_id))
+    keys = cast(KeyQueryDict, client.get_user_keys(user_ids))
 
-    # verify master key against given keyring
-    verifier(keys['master_keys'][user_id])
+    ret = []
 
-    return build_keyring(keys, user_id)
+    # verify master keys against given keyring
+    for uid in user_ids:
+        if uid not in keys['master_keys']:
+            warnings.warn("No master key for user {}!".format(uid))
+            continue
+
+        try:
+            verifier(keys['master_keys'][uid])
+        except Exception as e:
+            warnings.warn("Verification of master key failed for user {}: {}".format(uid, str(e)))
+            continue
+
+        try:
+            ret.append(build_keyring(keys, uid))
+        except Exception as e:
+            warnings.warn("Failed to build key ring for user {}: {}".format(uid, str(e)))
+
+    return ret
 
 class PublicKeyVerifier:
     pubs: Dict[str, PublicKey]
@@ -691,26 +708,28 @@ def cmd_sign_pubkeys(client: MatrixClient, args: argparse.Namespace) -> None:
     signer = args.own(args)
     sigs: Dict[str, Dict[str, XSigningKeyDict]] = dict()
 
-    for t in args.targets:
-        signee = fetch_keyring(client, t, args.trust_anchor(args))
+    signees = fetch_keyrings(client, args.targets, args.trust_anchor(args))
 
+    for signee in signees:
+        user_id = signee.user_id
         key_id = signee.master_key.to_B64Str().unpad()
         keydat = signee.get_master_key_dict()
         signed = signer.sign_user_key(keydat)
 
-        if t not in sigs:
-            sigs[t] = dict()
-        sigs[t][key_id] = signed
+        if user_id not in sigs:
+            sigs[user_id] = dict()
+        sigs[user_id][key_id] = signed
+
+        print('Signed key {} for user {}.'.format(key_id, user_id))
 
     if sigs:
         client.post_user_signatures(sigs)
 
 def cmd_list_pubkeys(client: MatrixClient, args: argparse.Namespace) -> None:
-    for t in args.targets:
-        try:
-            print(fetch_keyring(client, t, args.trust_anchor(args)))
-        except Exception as e:
-            warnings.warn("Failed to fetch keyring for user {}: {}".format(t, str(e)))
+    krs = fetch_keyrings(client, args.targets, args.trust_anchor(args))
+
+    for k in krs:
+        print(k)
 
 def cmd_own_pubkeys(client: MatrixClient, args: argparse.Namespace) -> None:
     print(args.own(args))
@@ -746,7 +765,7 @@ class OwnPubkey(AbstractOwnCached):
 
     def _get_own(self, namespace: argparse.Namespace) -> XSigningKeyRing:
         ver = PublicKeyVerifier({namespace.login: self.pub})
-        return fetch_keyring(self.client, namespace.login, ver)
+        return fetch_keyrings(self.client, [namespace.login], ver)[0]
 
 class OwnRecovery(AbstractOwnCached):
     def _get_own(self, namespace: argparse.Namespace) -> XSigningKeyRing:
