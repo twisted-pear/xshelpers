@@ -706,9 +706,11 @@ def cmd_sign_pubkeys(client: MatrixClient, args: argparse.Namespace) -> None:
         client.post_user_signatures(sigs)
 
 def cmd_list_pubkeys(client: MatrixClient, args: argparse.Namespace) -> None:
-    # TODO: warn, don't die
     for t in args.targets:
-        print(fetch_keyring(client, t, args.trust_anchor(args)))
+        try:
+            print(fetch_keyring(client, t, args.trust_anchor(args)))
+        except Exception as e:
+            warnings.warn("Failed to fetch keyring for user {}: {}".format(t, str(e)))
 
 def cmd_own_pubkeys(client: MatrixClient, args: argparse.Namespace) -> None:
     print(args.own(args))
