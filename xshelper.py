@@ -704,6 +704,7 @@ def InsecureVerifier(keydat: XSigningKeyDict) -> None:
 #       difference between own key and other ppl's key user-signing key is accessible
 
 import argparse
+import getpass
 import os
 import sys
 
@@ -828,7 +829,7 @@ def access_token(arg: str) -> Callable[[], str]:
     def access_token_value() -> str:
         return arg
     def access_token_input() -> str:
-        return input("Access Token: ")
+        return getpass.getpass("Access Token: ")
 
     if not arg:
         return access_token_input
@@ -842,7 +843,7 @@ def recovery_key(arg: str) -> Callable[[], B58Str]:
     def recovery_key_value() -> B58Str:
         return B58Str(arg.replace(' ', ''))
     def recovery_key_input() -> B58Str:
-        return B58Str(input("Recovery Key: ").replace(' ', ''))
+        return B58Str(getpass.getpass("Recovery Key: ").replace(' ', ''))
 
     if not arg:
         return recovery_key_input
