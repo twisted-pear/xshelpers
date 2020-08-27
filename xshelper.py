@@ -692,15 +692,10 @@ def InsecureVerifier(keydat: XSigningKeyDict) -> None:
 # TODO: validate inputs from server (jsonschema?)
 
 # TODO: potential use cases:
-#       listing a user's public keys (optional trust anchor)
-#       signing an individual user's master key (trust anchor?)
 #       exporting own signatures for later use as trust anchor?
-#       signing a list of user's master keys
-#       potential turst anchors:
-#           - own master key (give pubkey or recovery key to make sure
+#       potential trust anchors:
 #           - other list with signatures from other user, anchor with pubkey or by transitivity from own key
 #           - other user's master key (give pubkey or insure signed by own key... transitivity?)
-#           - just a list of mxid, pubkey tuples
 #       difference between own key and other ppl's key user-signing key is accessible
 
 import argparse
