@@ -7,6 +7,7 @@ from typing import (Callable, ClassVar, Dict, List, Mapping, NewType, Optional, 
 import abc
 import base58
 import base64
+import copy
 import json
 import secrets
 
@@ -315,13 +316,15 @@ class XSigningKeyRingException(Exception):
 
 class XSigningKeyRing:
     master_key: PublicKey
+    master_key_signatures: Dict[str, Dict[str, str]]
     user_id: str
     self_signing_key: Optional[KeyPair]
     user_signing_key: Optional[KeyPair]
     device_keys: Dict[str, PublicKey]
 
-    def __init__(self, master_pub: PublicKey, user_id: str):
+    def __init__(self, master_pub: PublicKey, master_sigs: Dict[str, Dict[str, str]], user_id: str):
         self.master_key = master_pub
+        self.master_key_signatures = copy.deepcopy(master_sigs)
         self.user_id = user_id
         self.self_signing_key = None
         self.user_signing_key = None
@@ -371,7 +374,7 @@ class XSigningKeyRing:
         user_id = keydat['user_id']
         kp = XSigningKeyRing._get_keypair(priv, keydat)
 
-        return XSigningKeyRing(kp.public, user_id)
+        return XSigningKeyRing(kp.public, keydat['signatures'], user_id)
 
     def get_master_key_dict(self) -> XSigningKeyDict:
         ms_b64 = self.master_key.to_B64Str().unpad()
@@ -381,7 +384,7 @@ class XSigningKeyRing:
             },
             "usage": [ "master" ],
             "user_id": self.user_id,
-            "signatures": {}
+            "signatures": copy.deepcopy(self.master_key_signatures)
         })
 
     def sign_user_key(self, to_sign: XSigningKeyDict) -> XSigningKeyDict:
@@ -704,6 +707,20 @@ import argparse
 import os
 import sys
 
+def cmd_export_pubkeys(client: MatrixClient, args: argparse.Namespace) -> None:
+    signer = args.own(args)
+
+    signees = fetch_keyrings(client, args.targets, args.trust_anchor(args))
+
+    keys = dict()
+    for signee in signees:
+        user_id = signee.user_id
+        keydat = signee.get_master_key_dict()
+
+        keys[user_id] = keydat
+
+    print(json.dumps({'master_keys': keys}, indent=4, sort_keys=True))
+
 def cmd_sign_pubkeys(client: MatrixClient, args: argparse.Namespace) -> None:
     signer = args.own(args)
     sigs: Dict[str, Dict[str, XSigningKeyDict]] = dict()
@@ -780,26 +797,28 @@ class OwnAction(argparse.Action):
             pub_b64 =  PublicKey.from_B64Str(B64Str(values))
             namespace.own = OwnPubkey(namespace, pub_b64)
 
+def get_own_verifier(namespace: argparse.Namespace) -> Callable[[XSigningKeyDict], None]:
+    return namespace.own(namespace).verify_user_key
+
+def get_pubkey_verifier(namespace: argparse.Namespace) -> Callable[[XSigningKeyDict], None]:
+    if len(namespace.pubkey) < len(namespace.targets):
+        raise ValueError("Not enough public keys!")
+
+    ks = dict(zip(namespace.targets, namespace.pubkey))
+    return PublicKeyVerifier(ks)
+
 class TrustAnchorAction(argparse.Action):
     def __call__(self, parser, namespace, values, option_string=None) -> None:
         if values == 'own':
             if not namespace.own:
                 parser.error('--own/-o required for --trust-anchor=own')
 
-            def get_own_verifier(namespace: argparse.Namespace) -> Callable[[XSigningKeyDict], None]:
-                return namespace.own(namespace).verify_user_key
             namespace.trust_anchor = get_own_verifier
 
         elif values == 'pubkey':
             if not namespace.pubkey:
                 parser.error('--pubkey/-p required for --trust-anchor=pubkey')
 
-            def get_pubkey_verifier(namespace: argparse.Namespace) -> Callable[[XSigningKeyDict], None]:
-                if len(namespace.pubkey) < len(namespace.targets):
-                    raise ValueError("Not enough public keys!")
-
-                ks = dict(zip(namespace.targets, namespace.pubkey))
-                return PublicKeyVerifier(ks)
             namespace.trust_anchor = get_pubkey_verifier
 
         else:
@@ -883,6 +902,14 @@ if __name__ == "__main__":
                 "and 'none' for no verification.")
     }
 
+    trg_args = ['targets']
+    trg_kwargs = {
+            'metavar': 'MXID',
+            'action': 'extend',
+            'nargs': '+',
+            'help': "MXID of a target user."
+    }
+
     subparsers = parser.add_subparsers(dest='command', title='commands', required=True,
             help="Available commands.")
 
@@ -892,15 +919,14 @@ if __name__ == "__main__":
     list_p.add_argument(*rec_args, **rec_kwargs) # type: ignore
     list_p.add_argument(*own_args, **own_kwargs) # type: ignore
     list_p.add_argument(*ta_args, **ta_kwargs) # type: ignore
-    list_p.add_argument('targets', metavar='MXID', action='extend', nargs='+',
-            help="MXID of a target user.")
+    list_p.add_argument(*trg_args, **trg_kwargs) # type: ignore
     list_p.set_defaults(func=cmd_list_pubkeys)
 
     own_p = subparsers.add_parser('own',
             help="List your own public keys.")
-    own_p.set_defaults(func=cmd_own_pubkeys)
     own_p.add_argument(*rec_args, **rec_kwargs) # type: ignore
     own_p.add_argument(*own_args, **own_kwargs, required=True) # type: ignore
+    own_p.set_defaults(func=cmd_own_pubkeys)
 
     sign_p = subparsers.add_parser('sign',
             help="Sign other users' master keys.")
@@ -908,9 +934,16 @@ if __name__ == "__main__":
     sign_p.add_argument(*rec_args, **rec_kwargs) # type: ignore
     sign_p.add_argument(*own_args, **own_kwargs, choices=['recovery'], required=True) # type: ignore
     sign_p.add_argument(*ta_args, **{**ta_kwargs, 'choices': ['pubkey', 'none']}) # type: ignore
-    sign_p.add_argument('targets', metavar='MXID', action='extend', nargs='+',
-            help="MXID of a target user.")
+    sign_p.add_argument(*trg_args, **trg_kwargs) # type: ignore
     sign_p.set_defaults(func=cmd_sign_pubkeys)
+
+    export_p = subparsers.add_parser('export',
+            help="Export your own signatures for the given users' master keys.")
+    export_p.add_argument(*rec_args, **rec_kwargs) # type: ignore
+    export_p.add_argument(*own_args, **own_kwargs, required=True) # type: ignore
+    export_p.set_defaults(trust_anchor=get_own_verifier)
+    export_p.add_argument(*trg_args, **trg_kwargs) # type: ignore
+    export_p.set_defaults(func=cmd_export_pubkeys)
 
     parsed_args = parser.parse_args()
 
