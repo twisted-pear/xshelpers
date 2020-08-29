@@ -314,6 +314,7 @@ class DeviceKeyDict(KeyDict):
 class XSigningKeyRingException(Exception):
     pass
 
+# TODO: rethink this and allow keyrings without master key?
 class XSigningKeyRing:
     master_key: PublicKey
     master_key_signatures: Dict[str, Dict[str, str]]
@@ -321,6 +322,7 @@ class XSigningKeyRing:
     self_signing_key: Optional[KeyPair]
     user_signing_key: Optional[KeyPair]
     device_keys: Dict[str, PublicKey]
+    unsigned_device_keys: Dict[str, PublicKey]
 
     def __init__(self, master_pub: PublicKey, master_sigs: Dict[str, Dict[str, str]], user_id: str):
         self.master_key = master_pub
@@ -329,6 +331,7 @@ class XSigningKeyRing:
         self.self_signing_key = None
         self.user_signing_key = None
         self.device_keys = dict()
+        self.unsigned_device_keys = dict()
 
     def __repr__(self) -> str:
         return ('XSigningKeyRing(master: {}, user_id: {},'
@@ -352,19 +355,28 @@ class XSigningKeyRing:
                     "\n        {}: {}".format(dev_id, pub_b64)
             )
 
+        u_devkeys = ''
+        for dev_id, pub in self.unsigned_device_keys.items():
+            pub_b64 = pub.to_B64Str().unpad()
+            u_devkeys = u_devkeys + (
+                    "\n        {}: {}".format(dev_id, pub_b64)
+            )
+
         return (
                 "User {}:\n"
                 "    Master Key: {}\n"
                 "    Self-signing Key: {}\n"
                 "        Signed Devices: {}\n"
+                "        Unsigned Devices: {}\n"
                 "    User-signing Key: {}"
         ).format(
                 self.user_id,
                 self.master_key.to_B64Str().unpad(),
                 ss_b64,
-                '{}',
+                devkeys or "None",
+                u_devkeys or "None",
                 us_b64
-        ).format(devkeys or "None")
+        )
 
     @classmethod
     def from_master_key_dict(cls, priv: Optional[PrivateKey], keydat: XSigningKeyDict) -> XSigningKeyRing:
@@ -450,14 +462,9 @@ class XSigningKeyRing:
         self._check_signature(self.master_key, keydat)
         self.user_signing_key = XSigningKeyRing._get_keypair(priv, keydat)
 
-    def add_device_key(self, keydat: DeviceKeyDict) -> str:
+    def _check_and_get_device_key(self, keydat: DeviceKeyDict) -> Tuple[str, PublicKey]:
         if self.user_id != keydat['user_id']:
             raise ValueError("Invalid user ID!")
-
-        if not self.self_signing_key:
-            raise ValueError("No self-signing key set!")
-
-        self._check_signature(self.self_signing_key.public, keydat)
 
         dev_id = keydat['device_id']
         if not 'ed25519:' + dev_id in keydat['keys']:
@@ -466,7 +473,23 @@ class XSigningKeyRing:
         pub = PublicKey.from_B64Str(B64Str(keydat['keys']['ed25519:' + dev_id]))
         self._check_signature(pub, keydat, dev_id)
 
+        return (dev_id, pub)
+
+    def add_device_key(self, keydat: DeviceKeyDict) -> str:
+        (dev_id, pub) = self._check_and_get_device_key(keydat)
+
+        if not self.self_signing_key:
+            raise ValueError("No self-signing key set!")
+
+        self._check_signature(self.self_signing_key.public, keydat)
+
         self.device_keys[dev_id] = pub
+
+        return dev_id
+
+    def add_unsigned_device_key(self, keydat: DeviceKeyDict) -> str:
+        (dev_id, pub) = self._check_and_get_device_key(keydat)
+        self.unsigned_device_keys[dev_id] = pub
 
         return dev_id
 
@@ -596,7 +619,12 @@ def build_keyring(keys: KeyQueryDict, user_id: str,
 
     for dev_id, dat in keys['device_keys'][user_id].items():
         try:
-            if dev_id != kr.add_device_key(dat):
+            try:
+                i_dev_id = kr.add_device_key(dat)
+            except XSigningKeyRingException as e:
+                i_dev_id = kr.add_unsigned_device_key(dat)
+
+            if dev_id != i_dev_id:
                 raise ValueError("Invalid device ID!")
         except (ValueError, XSigningKeyRingException) as e:
             warnings.warn("No signature for {}'s device {}: {}".format(user_id, dev_id, e))
