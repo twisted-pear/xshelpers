@@ -725,6 +725,7 @@ def InsecureVerifier(keydat: XSigningKeyDict) -> None:
 #           - other list with signatures from other user, anchor with pubkey or by transitivity from own key
 #           - other user's master key (give pubkey or insure signed by own key... transitivity?)
 #       difference between own key and other ppl's key user-signing key is accessible
+#       a "raw" mode to query keys directly
 
 import argparse
 import getpass
