@@ -663,7 +663,7 @@ def fetch_own_keyring(client: MatrixClient, user_id: str, rkey: B58Str,
     return build_own_keyring(keys, user_id, ms, ss, us)
 
 def fetch_keyrings(client: MatrixClient, user_ids: List[str],
-        verifier: Callable[[XSigningKeyDict], None]) -> List[XSigningKeyRing]:
+        verifier: Callable[[XSigningKeyRing], None]) -> List[XSigningKeyRing]:
     # query keys
     # TODO: proper checks instead of cast
     keys = cast(KeyQueryDict, client.get_user_keys(user_ids))
@@ -677,15 +677,18 @@ def fetch_keyrings(client: MatrixClient, user_ids: List[str],
             continue
 
         try:
-            verifier(keys['master_keys'][uid])
+            kr = build_keyring(keys, uid)
+        except Exception as e:
+            warnings.warn("Failed to build key ring for user {}: {}".format(uid, str(e)))
+            continue
+
+        try:
+            verifier(kr)
         except Exception as e:
             warnings.warn("Verification of master key failed for user {}: {}".format(uid, str(e)))
             continue
 
-        try:
-            ret.append(build_keyring(keys, uid))
-        except Exception as e:
-            warnings.warn("Failed to build key ring for user {}: {}".format(uid, str(e)))
+        ret.append(kr)
 
     return ret
 
@@ -695,25 +698,18 @@ class PublicKeyVerifier:
     def __init__(self, pubs: Dict[str, PublicKey]):
         self.pubs = pubs
 
-    def __call__(self, keydat: XSigningKeyDict) -> None:
-        if not keydat['keys']:
-            raise ValueError("No keys!")
-
-        if len(keydat['keys']) > 1:
-            raise ValueError("No keys!")
-
-        # compare key with given public key
-        key_b64 = B64Str(next(iter(keydat['keys'].values())))
-
-        user_id = keydat['user_id']
-
+    def __call__(self, keyring: XSigningKeyRing) -> None:
+        # check if we have public key for the user
+        user_id = keyring.user_id
         if not self.pubs[user_id]:
             raise ValueError("No public key for user {}!".format(user_id))
 
+        # compare key with given public key
+        key_b64 = keyring.master_key.to_B64Str()
         if key_b64 != self.pubs[user_id].to_B64Str():
             raise ValueError("Public key for user {} does not match expected value!".format(user_id))
 
-def InsecureVerifier(keydat: XSigningKeyDict) -> None:
+def InsecureVerifier(keydat: XSigningKeyRing) -> None:
     pass
 
 # TODO: check if foreign master key is signed by foreign device key which is signed with own device key which is signed by self-signing key (to bootstrap cross-trust from device-trust)
@@ -822,10 +818,10 @@ class OwnAction(argparse.Action):
             pub_b64 =  PublicKey.from_B64Str(B64Str(values))
             namespace.own = OwnPubkey(namespace, pub_b64)
 
-def get_own_verifier(namespace: argparse.Namespace) -> Callable[[XSigningKeyDict], None]:
-    return namespace.own(namespace).verify_user_key
+def get_own_verifier(namespace: argparse.Namespace) -> Callable[[XSigningKeyRing], None]:
+    return lambda kr: namespace.own(namespace).verify_user_key(kr.get_master_key_dict())
 
-def get_pubkey_verifier(namespace: argparse.Namespace) -> Callable[[XSigningKeyDict], None]:
+def get_pubkey_verifier(namespace: argparse.Namespace) -> Callable[[XSigningKeyRing], None]:
     if len(namespace.pubkey) < len(namespace.targets):
         raise ValueError("Not enough public keys!")
 
