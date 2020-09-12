@@ -784,7 +784,6 @@ def InsecureVerifier(keydat: XSigningKeyRing) -> None:
 #           - other list with signatures from other user, anchor with pubkey or by transitivity from own key
 #           - other user's master key (give pubkey or insure signed by own key... transitivity?)
 #       difference between own key and other ppl's key user-signing key is accessible
-#       a "raw" mode to query keys directly
 
 import argparse
 import getpass
@@ -826,6 +825,10 @@ def cmd_sign_pubkeys(client: MatrixClient, args: argparse.Namespace) -> None:
     if sigs:
         client.post_user_signatures(sigs)
 
+def cmd_raw_query(client: MatrixClient, args: argparse.Namespace) -> None:
+    keys = cast(KeyQueryDict, client.get_user_keys(args.targets))
+    print(json.dumps(keys, indent=4, sort_keys=True))
+
 def cmd_list_pubkeys(client: MatrixClient, args: argparse.Namespace) -> None:
     krs = fetch_keyrings(client, args.targets, args.trust_anchor(args))
 
@@ -836,12 +839,10 @@ def cmd_own_pubkeys(client: MatrixClient, args: argparse.Namespace) -> None:
     print(args.own(args))
 
 class AbstractOwnCached:
-    namespace: argparse.Namespace
     client: MatrixClient
     own: Optional[XSigningKeyRing]
 
-    def __init__(self, namespace: argparse.Namespace):
-        self.namespace = namespace
+    def __init__(self):
         self.own = None
 
     def set_client(self, client: MatrixClient):
@@ -860,8 +861,8 @@ class AbstractOwnCached:
 class OwnPubkey(AbstractOwnCached):
     pub: PublicKey
 
-    def __init__(self, namespace: argparse.Namespace, pub: PublicKey):
-        super(OwnPubkey, self).__init__(namespace)
+    def __init__(self, pub: PublicKey):
+        super(OwnPubkey, self).__init__()
         self.pub = pub
 
     def _get_own(self, namespace: argparse.Namespace) -> XSigningKeyRing:
@@ -875,11 +876,11 @@ class OwnRecovery(AbstractOwnCached):
 class OwnAction(argparse.Action):
     def __call__(self, parser, namespace, values, option_string=None) -> None:
         if values == 'recovery':
-            namespace.own = OwnRecovery(namespace)
+            namespace.own = OwnRecovery()
 
         else:
             pub_b64 =  PublicKey.from_B64Str(B64Str(values))
-            namespace.own = OwnPubkey(namespace, pub_b64)
+            namespace.own = OwnPubkey(pub_b64)
 
 def get_own_verifier(namespace: argparse.Namespace) -> Callable[[XSigningKeyRing], None]:
     return lambda kr: namespace.own(namespace).verify_user_key(kr.master_key.get_key_dict())
@@ -997,6 +998,11 @@ if __name__ == "__main__":
     subparsers = parser.add_subparsers(dest='command', title='commands', required=True,
             help="Available commands.")
 
+    raw_p = subparsers.add_parser('raw',
+            help="Query public keys stored for the given users. No verification is performed.")
+    raw_p.add_argument(*trg_args, **trg_kwargs) # type: ignore
+    raw_p.set_defaults(func=cmd_raw_query)
+
     list_p = subparsers.add_parser('list',
             help="List the target users' public keys.")
     list_p.add_argument(*pub_args, **pub_kwargs) # type: ignore
@@ -1033,7 +1039,7 @@ if __name__ == "__main__":
 
     client = MatrixClient(parsed_args.url, parsed_args.access_token())
 
-    if parsed_args.own:
+    if vars(parsed_args).get('own', None):
         parsed_args.own.set_client(client)
 
     parsed_args.func(client, parsed_args)
