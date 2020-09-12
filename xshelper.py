@@ -401,6 +401,7 @@ class XSigningKeyPair(KeyPair):
     public: XSigningKey
 
 # TODO: rethink this and allow keyrings without master key?
+# TODO: rework the interface to this to work on keys and not key dicts?
 class XSigningKeyRing:
     master_key: XSigningKey
     user_id: str
