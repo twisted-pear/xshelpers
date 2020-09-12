@@ -82,7 +82,7 @@ class KeyPair:
         pass
 
     def __init__(self, private: Optional[PrivateKey], public: Optional[PublicKey]):
-        self.private = None
+        self.private = private
 
         if not private:
             if not public:
@@ -91,10 +91,13 @@ class KeyPair:
             self.public = public
             return
 
-        self.private = private
-        self.public = private.public_key()
+        pr_public = private.public_key()
+        if not public:
+            self.public = pr_public
+            return
 
-        if public and self.public.to_B64Str() != public.to_B64Str():
+        self.public = public
+        if public.to_B64Str() != pr_public.to_B64Str():
             raise ValueError("Invalid public key!")
 
     def __repr__(self) -> str:
@@ -314,20 +317,101 @@ class DeviceKeyDict(KeyDict):
 class XSigningKeyRingException(Exception):
     pass
 
+class SignedPublicKey(PublicKey):
+    # The key dict is stored entirely to avoid issues when a malicious server
+    # adds additional entries to the key dict. These would not be covered by a
+    # genuine signature. To detect this attack during signature verification,
+    # the key dict used must match the one used for creation of the key object
+    # exactly.
+    _key_dict: KeyDict
+    signatures: Dict[str, Dict[str, str]]
+    user_id: str
+
+    def __init__(self, keydat: KeyDict, kid: str = None):
+        if not keydat['user_id']:
+            raise ValueError("User ID missing!")
+
+        b64 = None
+
+        if kid:
+            if 'ed25519:' + kid in keydat['keys']:
+                b64 = B64Str(keydat['keys']['ed25519:' + kid])
+
+        else:
+            for i, k in keydat['keys'].items():
+                if i.startswith('ed25519:'):
+                    b64 = B64Str(k)
+                    break
+
+        if not b64:
+            raise ValueError("No key!")
+
+        self._key_dict = copy.deepcopy(keydat)
+        self.signatures = self._key_dict['signatures']
+        self.user_id = keydat['user_id']
+
+        pub = PublicKey.from_B64Str(b64)
+        super(SignedPublicKey, self).__init__(pub._pub)
+
+    def get_key_dict(self) -> KeyDict:
+        return copy.deepcopy(self._key_dict)
+
+class XSigningKey(SignedPublicKey):
+    _key_dict: XSigningKeyDict
+    usage: List[str]
+
+    def __init__(self, keydat: XSigningKeyDict):
+        # assume just one key
+        if len(keydat['keys']) > 1:
+            raise ValueError("Too many keys!")
+
+        if len(keydat['usage']) <= 0:
+            raise ValueError("Key usage missing!")
+
+        super(XSigningKey, self).__init__(keydat)
+        self.usage = self._key_dict['usage']
+
+    def get_key_dict(self) -> XSigningKeyDict:
+        kd = super(XSigningKey, self).get_key_dict()
+        return cast(XSigningKeyDict, kd)
+
+class DeviceKey(SignedPublicKey):
+    _key_dict: DeviceKeyDict
+    algorithms: List[str]
+    device_id: str
+    unsigned: dict
+
+    def __init__(self, keydat: DeviceKeyDict):
+        if len(keydat['algorithms']) <= 0:
+            raise ValueError("Algorithms missing!")
+
+        if not keydat['device_id']:
+            raise ValueError("Device ID missing!")
+
+        super(DeviceKey, self).__init__(keydat, keydat['device_id'])
+        self.algorithms = self._key_dict['algorithms']
+        self.device_id = keydat['device_id']
+        self.unsigned = self._key_dict['unsigned']
+
+    def get_key_dict(self) -> DeviceKeyDict:
+        kd = super(DeviceKey, self).get_key_dict()
+        return cast(DeviceKeyDict, kd)
+
+class XSigningKeyPair(KeyPair):
+    public: XSigningKey
+
 # TODO: rethink this and allow keyrings without master key?
 class XSigningKeyRing:
-    master_key: PublicKey
-    master_key_signatures: Dict[str, Dict[str, str]]
+    master_key: XSigningKey
     user_id: str
-    self_signing_key: Optional[KeyPair]
-    user_signing_key: Optional[KeyPair]
-    device_keys: Dict[str, PublicKey]
-    unsigned_device_keys: Dict[str, PublicKey]
+    self_signing_key: Optional[XSigningKeyPair]
+    user_signing_key: Optional[XSigningKeyPair]
+    device_keys: Dict[str, DeviceKey]
+    unsigned_device_keys: Dict[str, DeviceKey]
 
-    def __init__(self, master_pub: PublicKey, master_sigs: Dict[str, Dict[str, str]], user_id: str):
+    def __init__(self, master_pub: XSigningKey):
         self.master_key = master_pub
-        self.master_key_signatures = copy.deepcopy(master_sigs)
-        self.user_id = user_id
+        self.user_id = master_pub.user_id
         self.self_signing_key = None
         self.user_signing_key = None
         self.device_keys = dict()
@@ -386,18 +470,7 @@ class XSigningKeyRing:
         user_id = keydat['user_id']
         kp = XSigningKeyRing._get_keypair(priv, keydat)
 
-        return XSigningKeyRing(kp.public, keydat['signatures'], user_id)
-
-    def get_master_key_dict(self) -> XSigningKeyDict:
-        ms_b64 = self.master_key.to_B64Str().unpad()
-        return XSigningKeyDict({
-            "keys": {
-                'ed25519:' + ms_b64: ms_b64
-            },
-            "usage": [ "master" ],
-            "user_id": self.user_id,
-            "signatures": copy.deepcopy(self.master_key_signatures)
-        })
+        return XSigningKeyRing(kp.public)
 
     def sign_user_key(self, to_sign: XSigningKeyDict) -> XSigningKeyDict:
         if not self.user_signing_key:
@@ -431,16 +504,9 @@ class XSigningKeyRing:
         pub.verify_dict(keydat, sig)
 
     @staticmethod
-    def _get_keypair(priv: Optional[PrivateKey], keydat: XSigningKeyDict) -> KeyPair:
-        if not keydat['keys']:
-            raise ValueError("No keys!")
-
-        if len(keydat['keys']) > 1:
-            raise ValueError("No keys!")
-
-        # assume just one key
-        pub = PublicKey.from_B64Str(B64Str(next(iter(keydat['keys'].values()))))
-        return KeyPair(priv, pub)
+    def _get_keypair(priv: Optional[PrivateKey], keydat: XSigningKeyDict) -> XSigningKeyPair:
+        pub = XSigningKey(keydat)
+        return XSigningKeyPair(priv, pub)
 
     def set_self_signing_key(self, priv: Optional[PrivateKey], keydat: XSigningKeyDict) -> None:
         if "self_signing" not in keydat['usage']:
@@ -462,36 +528,32 @@ class XSigningKeyRing:
         self._check_signature(self.master_key, keydat)
         self.user_signing_key = XSigningKeyRing._get_keypair(priv, keydat)
 
-    def _check_and_get_device_key(self, keydat: DeviceKeyDict) -> Tuple[str, PublicKey]:
+    def _check_and_get_device_key(self, keydat: DeviceKeyDict) -> DeviceKey:
         if self.user_id != keydat['user_id']:
             raise ValueError("Invalid user ID!")
 
-        dev_id = keydat['device_id']
-        if not 'ed25519:' + dev_id in keydat['keys']:
-            raise ValueError("No key for device!")
+        pub = DeviceKey(keydat)
+        self._check_signature(pub, keydat, pub.device_id)
 
-        pub = PublicKey.from_B64Str(B64Str(keydat['keys']['ed25519:' + dev_id]))
-        self._check_signature(pub, keydat, dev_id)
-
-        return (dev_id, pub)
+        return pub
 
     def add_device_key(self, keydat: DeviceKeyDict) -> str:
-        (dev_id, pub) = self._check_and_get_device_key(keydat)
+        pub = self._check_and_get_device_key(keydat)
 
         if not self.self_signing_key:
             raise ValueError("No self-signing key set!")
 
         self._check_signature(self.self_signing_key.public, keydat)
 
-        self.device_keys[dev_id] = pub
+        self.device_keys[pub.device_id] = pub
 
-        return dev_id
+        return pub.device_id
 
     def add_unsigned_device_key(self, keydat: DeviceKeyDict) -> str:
-        (dev_id, pub) = self._check_and_get_device_key(keydat)
-        self.unsigned_device_keys[dev_id] = pub
+        pub = self._check_and_get_device_key(keydat)
+        self.unsigned_device_keys[pub.device_id] = pub
 
-        return dev_id
+        return pub.device_id
 
     def verify_user_key(self, keydat: XSigningKeyDict) -> None:
         if "master" not in keydat['usage']:
@@ -736,7 +798,7 @@ def cmd_export_pubkeys(client: MatrixClient, args: argparse.Namespace) -> None:
     keys = dict()
     for signee in signees:
         user_id = signee.user_id
-        keydat = signee.get_master_key_dict()
+        keydat = signee.master_key.get_key_dict()
 
         keys[user_id] = keydat
 
@@ -751,7 +813,7 @@ def cmd_sign_pubkeys(client: MatrixClient, args: argparse.Namespace) -> None:
     for signee in signees:
         user_id = signee.user_id
         key_id = signee.master_key.to_B64Str().unpad()
-        keydat = signee.get_master_key_dict()
+        keydat = signee.master_key.get_key_dict()
         signed = signer.sign_user_key(keydat)
 
         if user_id not in sigs:
@@ -819,7 +881,7 @@ class OwnAction(argparse.Action):
             namespace.own = OwnPubkey(namespace, pub_b64)
 
 def get_own_verifier(namespace: argparse.Namespace) -> Callable[[XSigningKeyRing], None]:
-    return lambda kr: namespace.own(namespace).verify_user_key(kr.get_master_key_dict())
+    return lambda kr: namespace.own(namespace).verify_user_key(kr.master_key.get_key_dict())
 
 def get_pubkey_verifier(namespace: argparse.Namespace) -> Callable[[XSigningKeyRing], None]:
     if len(namespace.pubkey) < len(namespace.targets):
