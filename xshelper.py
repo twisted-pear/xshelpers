@@ -790,6 +790,39 @@ import getpass
 import os
 import sys
 
+def cmd_import_pubkeys(client: MatrixClient, args: argparse.Namespace) -> None:
+    signer = args.own(args)
+
+    import_keydat = json.load(sys.stdin)
+    # TODO: verify import for well-formedness
+
+    source_krs = fetch_keyrings(client, [args.source], args.trust_anchor(args))
+    if len(source_krs) != 1:
+        raise Exception("Failed to retrieve signer keyring!")
+    source = source_krs[0]
+
+    if args.source not in import_keydat['user_signing_keys']:
+        raise Exception("Signer's user signing-key is missing!")
+    source.set_user_signing_key(None, import_keydat['user_signing_keys'][args.source])
+
+    src_verifier = lambda kr: source.verify_user_key(kr.master_key.get_key_dict())
+
+    keys = import_keydat['master_keys']
+    for uid in keys.keys():
+        try:
+            kr = build_keyring(keys, uid)
+        except Exception as e:
+            warnings.warn("Failed to build key ring for user {}: {}".format(uid, str(e)))
+            continue
+
+        try:
+            src_verifier(kr)
+        except Exception as e:
+            warnings.warn("Verification of master key failed for user {}: {}".format(uid, str(e)))
+            continue
+
+    # TODO: read targets and signatures from file and verify with src_verifier
+
 def cmd_export_pubkeys(client: MatrixClient, args: argparse.Namespace) -> None:
     signer = args.own(args)
 
@@ -1040,6 +1073,15 @@ if __name__ == "__main__":
     export_p.set_defaults(trust_anchor=get_own_verifier)
     export_p.add_argument(*trg_args, **trg_kwargs) # type: ignore
     export_p.set_defaults(func=cmd_export_pubkeys)
+
+    import_p = subparsers.add_parser('import',
+            help="Import master keys signed by another user.")
+    import_p.add_argument(*pub_args, **{**pub_kwargs, 'nargs': 1}) # type: ignore
+    import_p.add_argument(*rec_args, **rec_kwargs) # type: ignore
+    import_p.add_argument(*own_args, **own_kwargs, choices=['recovery'], required=True) # type: ignore
+    import_p.add_argument(*ta_args, **{**ta_kwargs, 'choices': ['own', 'pubkey']}) # type: ignore
+    import_p.add_argument('source', metavar='MXID', help="MXID of the signing user.")
+    import_p.set_defaults(func=cmd_import_pubkeys)
 
     parsed_args = parser.parse_args()
 
