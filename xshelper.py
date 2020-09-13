@@ -802,7 +802,13 @@ def cmd_export_pubkeys(client: MatrixClient, args: argparse.Namespace) -> None:
 
         keys[user_id] = keydat
 
-    print(json.dumps({'master_keys': keys}, indent=4, sort_keys=True))
+    out = {
+            'master_keys': keys,
+            'user_signing_keys': {
+                signer.user_id: signer.user_signing_key.public.get_key_dict()
+            }
+    }
+    print(json.dumps(out, indent=4, sort_keys=True))
 
 def cmd_sign_pubkeys(client: MatrixClient, args: argparse.Namespace) -> None:
     signer = args.own(args)
