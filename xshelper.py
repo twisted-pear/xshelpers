@@ -793,35 +793,40 @@ import sys
 def cmd_import_pubkeys(client: MatrixClient, args: argparse.Namespace) -> None:
     signer = args.own(args)
 
-    import_keydat = json.load(sys.stdin)
     # TODO: verify import for well-formedness
+    import_keydat = json.load(sys.stdin)
 
-    source_krs = fetch_keyrings(client, [args.source], args.trust_anchor(args))
+    source_uid = args.source
+    source_krs = fetch_keyrings(client, [source_uid], args.trust_anchor(args))
     if len(source_krs) != 1:
         raise Exception("Failed to retrieve signer keyring!")
     source = source_krs[0]
 
-    if args.source not in import_keydat['user_signing_keys']:
+    if source_uid not in import_keydat['user_signing_keys']:
         raise Exception("Signer's user signing-key is missing!")
-    source.set_user_signing_key(None, import_keydat['user_signing_keys'][args.source])
-
-    src_verifier = lambda kr: source.verify_user_key(kr.master_key.get_key_dict())
+    source.set_user_signing_key(None, import_keydat['user_signing_keys'][source_uid])
 
     keys = import_keydat['master_keys']
+    sigs: Dict[str, Dict[str, XSigningKeyDict]] = dict()
     for uid in keys.keys():
-        try:
-            kr = build_keyring(keys, uid)
-        except Exception as e:
-            warnings.warn("Failed to build key ring for user {}: {}".format(uid, str(e)))
-            continue
+        keydat = keys[uid]
 
-        try:
-            src_verifier(kr)
-        except Exception as e:
-            warnings.warn("Verification of master key failed for user {}: {}".format(uid, str(e)))
-            continue
+        # verify the key against the source signer
+        source.verify_user_key(keydat)
 
-    # TODO: read targets and signatures from file and verify with src_verifier
+        # sign key with our own user signing key
+        signed = signer.sign_user_key(keydat)
+
+        if uid not in sigs:
+            sigs[uid] = dict()
+        key_id = XSigningKey(keydat).to_B64Str().unpad()
+        sigs[uid][key_id] = signed
+
+        print('Signed key {} for user {}.'.format(key_id, uid))
+
+    if sigs:
+        print(json.dumps(sigs, indent=4, sort_keys=True))
+        client.post_user_signatures(sigs)
 
 def cmd_export_pubkeys(client: MatrixClient, args: argparse.Namespace) -> None:
     signer = args.own(args)
@@ -925,10 +930,17 @@ def get_own_verifier(namespace: argparse.Namespace) -> Callable[[XSigningKeyRing
     return lambda kr: namespace.own(namespace).verify_user_key(kr.master_key.get_key_dict())
 
 def get_pubkey_verifier(namespace: argparse.Namespace) -> Callable[[XSigningKeyRing], None]:
-    if len(namespace.pubkey) < len(namespace.targets):
+    needed_pubkeys = len(vars(namespace).get('targets', []))
+    mxids = vars(namespace).get('targets', [])
+
+    if 'source' in vars(namespace):
+        needed_pubkeys = needed_pubkeys + 1
+        mxids.insert(0, namespace.source)
+
+    if len(namespace.pubkey) < needed_pubkeys:
         raise ValueError("Not enough public keys!")
 
-    ks = dict(zip(namespace.targets, namespace.pubkey))
+    ks = dict(zip(mxids, namespace.pubkey))
     return PublicKeyVerifier(ks)
 
 class TrustAnchorAction(argparse.Action):
