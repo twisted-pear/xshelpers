@@ -699,7 +699,7 @@ def build_own_keyring(keys: KeyQueryDict, user_id: str,
         user_signing_key: PrivateKey) -> XSigningKeyRing:
     kr = build_keyring(keys, user_id, master_key, self_signing_key, user_signing_key)
 
-    # add user-signing key
+    # make sure we have a user-signing key
     if not kr.user_signing_key:
         raise ValueError("No user-signing key!")
 
@@ -778,13 +778,6 @@ def InsecureVerifier(keydat: XSigningKeyRing) -> None:
 # TODO: check if foreign master key is signed by foreign device key which is signed with own device key which is signed by self-signing key (to bootstrap cross-trust from device-trust)
 # TODO: validate inputs from server (jsonschema?)
 
-# TODO: potential use cases:
-#       exporting own signatures for later use as trust anchor?
-#       potential trust anchors:
-#           - other list with signatures from other user, anchor with pubkey or by transitivity from own key
-#           - other user's master key (give pubkey or insure signed by own key... transitivity?)
-#       difference between own key and other ppl's key user-signing key is accessible
-
 import argparse
 import getpass
 import os
@@ -825,7 +818,6 @@ def cmd_import_pubkeys(client: MatrixClient, args: argparse.Namespace) -> None:
         print('Signed key {} for user {}.'.format(key_id, uid))
 
     if sigs:
-        print(json.dumps(sigs, indent=4, sort_keys=True))
         client.post_user_signatures(sigs)
 
 def cmd_export_pubkeys(client: MatrixClient, args: argparse.Namespace) -> None:
@@ -899,6 +891,10 @@ class AbstractOwnCached:
     def __call__(self, namespace: argparse.Namespace) -> XSigningKeyRing:
         if not self.own:
             self.own = self._get_own(namespace)
+
+        # make sure we have a user-signing key
+        if not self.own.user_signing_key:
+            raise ValueError("No user-signing key!")
 
         return self.own
 
